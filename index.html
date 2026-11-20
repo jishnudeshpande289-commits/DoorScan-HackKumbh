@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>DoorScan AI - Smart Classroom Terminal</title>
+  <script src="https://cdn.jsdelivr.net/npm/@vladmandic/face-api/dist/face-api.js"></script>
+  <style>
+    body { font-family: 'Segoe UI', Arial, sans-serif; background: #f0f4f8; color: #1e293b; text-align: center; padding: 20px; }
+    .container { max-width: 820px; margin: auto; background: #fff; padding: 24px; border-radius: 12px; box-shadow: 0 4px 16px rgba(0,0,0,0.08); }
+    video { border: 4px solid #334155; border-radius: 10px; transform: scaleX(-1); background: #000; }
+    button { padding: 10px 18px; font-size: 14px; font-weight: 600; border: none; border-radius: 6px; cursor: pointer; margin: 5px; }
+    .btn-primary { background: #2563eb; color: white; }
+    .btn-success { background: #16a34a; color: white; }
+    .btn-danger { background: #dc2626; color: white; }
+    .btn-warning { background: #d97706; color: white; }
+    input, select { padding: 10px; font-size: 14px; border: 1px solid #cbd5e1; border-radius: 6px; margin: 5px; }
+    #status { font-size: 18px; font-weight: bold; margin: 15px 0; padding: 12px; border-radius: 8px; background: #f8fafc; border: 1px solid #cbd5e1; }
+    #quizBox { display: none; margin-top: 20px; padding: 20px; border: 2px solid #2563eb; border-radius: 10px; background: #eff6ff; text-align: left; }
+    .badge { display: inline-block; padding: 4px 10px; border-radius: 12px; font-size: 12px; background: #e2e8f0; }
+  </style>
+</head>
+<body>
+
+<div class="container">
+  <h2>🚪 DoorScan AI — Classroom Entry & Assessment Terminal</h2>
+  <div>
+    <button id="connectSerial" class="btn-primary">1. Connect Arduino (USB)</button>
+    <button id="manualScanBtn" class="btn-warning">Manual Trigger Scan (Backup)</button>
+    <span id="offlineBadge" class="badge">Offline Queue: 0</span>
+  </div>
+
+  <br />
+  <video id="webcam" width="560" height="420" autoplay muted playsinline></video>
+  <div id="status">Step 1/4: Initializing script...</div>
+
+  <div style="border-top: 1px solid #e2e8f0; padding-top: 15px; margin-top: 15px;">
+    <h4>Register Authorized Student Face</h4>
+    <input type="text" id="regName" placeholder="Student Name (e.g., Rahul)" />
+    <input type="text" id="regRoll" placeholder="Roll No (e.g., RV26CS01)" />
+    <button id="registerFaceBtn" class="btn-success">Capture & Register Face</button>
+    <button id="clearFacesBtn" class="btn-danger">Reset All Faces</button>
+    <div id="regCount" style="font-size: 13px; color: #64748b; margin-top: 6px;">Registered Students: 0</div>
+  </div>
+
+  <div id="quizBox">
+    <h3 id="quizWelcome">Welcome! Complete Your Entry Check-In Quiz:</h3>
+    <p id="quizQuestion"><strong>Q: What does the Web Serial API allow a browser to do?</strong></p>
+    <select id="quizAnswer" style="width: 100%;">
+      <option value="">-- Select your answer --</option>
+      <option value="Communicate with USB/Serial hardware">Communicate directly with USB/Serial hardware like Arduino</option>
+      <option value="Edit CSS stylesheets">Edit CSS stylesheets offline</option>
+      <option value="Format hard drives">Format computer hard drives</option>
+    </select>
+    <br><br>
+    <button id="submitQuizBtn" class="btn-primary">Submit Attendance & Quiz</button>
+  </div>
+</div>
+
+<script>
+  // ================= CONFIGURATION (PASTE YOUR KEYS HERE) =================
+  const CONFIG = {
+    GOOGLE_SHEETS_WEBAPP_URL: "https://script.google.com/macros/s/AKfycbzH4O6A0ev-gabttPvfO2QEiCMCtg1jld3oan68g-M1mYqfxcIgMxB2Wgpn4HCOjg_C/exec",
+    TELEGRAM_BOT_TOKEN: "9248801207:AAGbRQ28vAM-5qMrElu-63Q02BVYMGpGOlg",
+    TELEGRAM_CHAT_ID: "8251623012"
+  };
+  // ========================================================================
+
+  let serialPort, writer;
+  let isModelLoaded = false;
+  let detectorOptions = null;
+  let currentStudent = null;
+  let lastAlertTime = 0;
+
+  let registeredUsers = JSON.parse(localStorage.getItem("doorscan_faces") || "[]");
+
+  const video = document.getElementById("webcam");
+  const statusDiv = document.getElementById("status");
+  const quizBox = document.getElementById("quizBox");
+
+  function updateUIStats() {
+    document.getElementById("regCount").innerText = `Registered Students: ${registeredUsers.length}`;
+    const queue = JSON.parse(localStorage.getItem("doorscan_offline_queue") || "[]");
+    document.getElementById("offlineBadge").innerText = `Offline Queue: ${queue.length}`;
+  }
+  updateUIStats();
+
+  // 1. Connect Arduino via Web Serial API
+  document.getElementById("connectSerial").addEventListener("click", async () => {
+    try {
+      serialPort = await navigator.serial.requestPort();
+      await serialPort.open({ baudRate: 9600 });
+      writer = serialPort.writable.getWriter();
+      statusDiv.innerText = "Arduino Connected! Monitoring Doorway...";
+      readFromArduino();
+    } catch (err) {
+      alert("Serial Error: " + err.message);
+    }
+  });
+
+  async function sendToArduino(cmd) {
+    if (writer) {
+      const encoder = new TextEncoder();
+      await writer.write(encoder.encode(cmd + "\n"));
+    }
+  }
+
+  async function readFromArduino() {
+    const decoder = new TextDecoderStream();
+    serialPort.readable.pipeTo(decoder.writable);
+    const reader = decoder.readable.getReader();
+    let buffer = "";
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += value;
+      if (buffer.includes("\n")) {
+        const lines = buffer.split("\n");
+        buffer = lines.pop();
+        for (const line of lines) {
+          if (line.trim() === "STUDENT_DETECTED") {
+            verifyFaceAtDoor();
+          }
+        }
+      }
+    }
+  }
+
+  // 2. Step-by-Step Startup with Clear Diagnostics
+  async function initSystem() {
+    try {
+      statusDiv.innerText = "Step 2/4: Requesting Webcam Access (Click 'Allow' if prompted)...";
+      const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+      video.srcObject = stream;
+
+      if (typeof faceapi === "undefined") {
+        throw new Error("face-api.js library failed to download. Check your internet connection!");
+      }
+
+      statusDiv.innerText = "Step 3/4: Webcam ON! Loading AI Face Models...";
+      const MODEL_URL = "https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model";
+
+      await faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL);
+      await faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL);
+      await faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL);
+
+      detectorOptions = new faceapi.TinyFaceDetectorOptions({ inputSize: 224, scoreThreshold: 0.5 });
+      isModelLoaded = true;
+
+      statusDiv.innerText = "✅ Step 4/4: System Ready! Register faces or test scan.";
+      statusDiv.style.color = "green";
+    } catch (err) {
+      console.error(err);
+      statusDiv.innerText = "❌ FAILED: " + err.message;
+      statusDiv.style.color = "red";
+    }
+  }
+
+  // 3. Register a New Face
+  document.getElementById("registerFaceBtn").addEventListener("click", async () => {
+    if (!isModelLoaded) return alert("Wait for AI models to finish loading.");
+    const name = document.getElementById("regName").value.trim();
+    const roll = document.getElementById("regRoll").value.trim();
+    if (!name || !roll) return alert("Enter both Student Name and Roll Number.");
+
+    statusDiv.innerText = `Scanning face for ${name}... Look straight at camera.`;
+    const detection = await faceapi.detectSingleFace(video, detectorOptions).withFaceLandmarks().withFaceDescriptor();
+
+    if (!detection) {
+      statusDiv.innerText = "No face detected! Adjust lighting and try again.";
+      statusDiv.style.color = "red";
+      return;
+    }
+
+    registeredUsers.push({
+      name,
+      roll,
+      descriptor: Array.from(detection.descriptor)
+    });
+    localStorage.setItem("doorscan_faces", JSON.stringify(registeredUsers));
+    document.getElementById("regName").value = "";
+    document.getElementById("regRoll").value = "";
+    statusDiv.innerText = `✅ Registered ${name} (${roll}) successfully!`;
+    statusDiv.style.color = "green";
+    updateUIStats();
+  });
+
+  document.getElementById("clearFacesBtn").addEventListener("click", () => {
+    localStorage.removeItem("doorscan_faces");
+    registeredUsers = [];
+    updateUIStats();
+    statusDiv.innerText = "All registered faces cleared.";
+  });
+
+  // 4. Verify Face
+  document.getElementById("manualScanBtn").addEventListener("click", verifyFaceAtDoor);
+
+  async function verifyFaceAtDoor() {
+    if (!isModelLoaded) return;
+    statusDiv.innerText = "Person detected at door! Scanning face...";
+    statusDiv.style.color = "#2563eb";
+
+    const detection = await faceapi.detectSingleFace(video, detectorOptions).withFaceLandmarks().withFaceDescriptor();
+    if (!detection) {
+      statusDiv.innerText = "Person detected, but face not clearly visible.";
+      return;
+    }
+
+    let matched = null;
+    let bestDistance = 0.55;
+
+    for (const user of registeredUsers) {
+      const savedDesc = new Float32Array(user.descriptor);
+      const dist = faceapi.euclideanDistance(detection.descriptor, savedDesc);
+      if (dist < bestDistance) {
+        bestDistance = dist;
+        matched = user;
+      }
+    }
+
+    if (matched) {
+      currentStudent = matched;
+      statusDiv.innerText = `✅ Verified: ${matched.name} (${matched.roll}) — Complete the entry quiz!`;
+      statusDiv.style.color = "green";
+      sendToArduino("WELCOME");
+      quizBox.style.display = "block";
+      document.getElementById("quizWelcome").innerText = `Welcome, ${matched.name} (${matched.roll})! Complete Entry Quiz:`;
+    } else {
+      quizBox.style.display = "none";
+      statusDiv.innerText = "🚨 ALERT: UNREGISTERED FACE DETECTED! Buzzer & Red LED Activated!";
+      statusDiv.style.color = "red";
+      sendToArduino("ALERT\n");
+
+      if (Date.now() - lastAlertTime > 10000) {
+        lastAlertTime = Date.now();
+        sendTelegramMessage(`🚨 *DoorScan Security Alert!*\nAn *unregistered person* tried entering the classroom at ${new Date().toLocaleTimeString()}.`);
+      }
+    }
+  }
+
+  // 5. Submit Quiz -> Sync to Google Sheets & Telegram
+  document.getElementById("submitQuizBtn").addEventListener("click", async () => {
+    const answer = document.getElementById("quizAnswer").value;
+    if (!answer) return alert("Please select an answer first!");
+    if (!currentStudent) return;
+
+    const isCorrect = answer === "Communicate with USB/Serial hardware" ? "Correct (1/1)" : "Incorrect (0/1)";
+    const record = {
+      timestamp: new Date().toLocaleString(),
+      name: currentStudent.name,
+      roll: currentStudent.roll,
+      status: "Present",
+      quizResult: isCorrect,
+      answer: answer
+    };
+
+    quizBox.style.display = "none";
+    document.getElementById("quizAnswer").value = "";
+    statusDiv.innerText = `✅ Attendance & Quiz saved for ${currentStudent.name}!`;
+
+    await syncRecord(record);
+    currentStudent = null;
+  });
+
+  // 6. Cloud Sync + Offline Queue Engine
+  async function syncRecord(record) {
+    const msg = `✅ *DoorScan Attendance & Quiz*\n👤 *Student:* ${record.name} (${record.roll})\n🕒 *Time:* ${record.timestamp}\n📝 *Quiz:* ${record.quizResult}`;
+
+    if (!navigator.onLine) {
+      saveToOfflineQueue(record);
+      return;
+    }
+
+    try {
+      if (CONFIG.GOOGLE_SHEETS_WEBAPP_URL.startsWith("http")) {
+        await fetch(CONFIG.GOOGLE_SHEETS_WEBAPP_URL, {
+          method: "POST",
+          mode: "no-cors",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(record)
+        });
+      }
+      await sendTelegramMessage(msg);
+    } catch (err) {
+      saveToOfflineQueue(record);
+    }
+  }
+
+  async function sendTelegramMessage(text) {
+    if (!CONFIG.TELEGRAM_BOT_TOKEN || CONFIG.TELEGRAM_BOT_TOKEN.includes("YOUR_")) return;
+    const url = `https://api.telegram.org/bot${CONFIG.TELEGRAM_BOT_TOKEN}/sendMessage`;
+    await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: CONFIG.TELEGRAM_CHAT_ID,
+        text: text,
+        parse_mode: "Markdown"
+      })
+    });
+  }
+
+  function saveToOfflineQueue(record) {
+    const queue = JSON.parse(localStorage.getItem("doorscan_offline_queue") || "[]");
+    queue.push(record);
+    localStorage.setItem("doorscan_offline_queue", JSON.stringify(queue));
+    updateUIStats();
+  }
+
+  window.addEventListener("online", async () => {
+    const queue = JSON.parse(localStorage.getItem("doorscan_offline_queue") || "[]");
+    if (queue.length === 0) return;
+    localStorage.removeItem("doorscan_offline_queue");
+    updateUIStats();
+    for (const item of queue) {
+      await syncRecord(item);
+    }
+  });
+
+  initSystem();
+</script>
+</body>
+</html>
